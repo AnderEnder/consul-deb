@@ -1,3 +1,9 @@
+consul (0.9.3-1~xenial1) xenial; urgency=low
+
+  * Release new version (0.9.3)
+
+ -- Andrii Radyk <ander.ender@gmail.com>  Tue, 19 Sep 2017 11:27:00 +0000
+
 consul (0.7.1-1~yakkety1~ppa2) yakkety; urgency=low
 
   * Fix build script to display correct version (fixes #14).
