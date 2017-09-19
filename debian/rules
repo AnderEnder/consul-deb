@@ -36,6 +36,7 @@ override_dh_installman:
 override_dh_auto_install:
 	mkdir -p usr/share/consul
 	mkdir -p etc
+	mkdir -p var/lib/consul
 	cp -a debian/consul.d etc
 
 %:

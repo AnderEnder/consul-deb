@@ -1,2 +1,3 @@
 usr/bin/consul
 etc/consul.d/20-agent.json
+var/lib/consul
