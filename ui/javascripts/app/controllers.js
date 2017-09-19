@@ -275,34 +275,6 @@ App.NodesShowController = Ember.ObjectController.extend({
   dc: Ember.computed.alias("controllers.dc"),
 
   actions: {
-    deregisterNode: function() {
-      this.set('isLoading', true);
-      var controller = this;
-      var node = controller.get('model');
-      var dc = controller.get('dc').get('datacenter');
-      var token = App.get('settings.token');
-
-      if (window.confirm("Are you sure you want to deregister this node?")) {
-        // Deregister node
-        Ember.$.ajax({
-            url: formatUrl(consulHost + '/v1/catalog/deregister', dc, token),
-            type: 'PUT',
-            data: JSON.stringify({
-              'Datacenter': dc,
-              'Node': node.Node
-            })
-        }).then(function(response) {
-          var nodes = controller.get('controllers.nodes').get('nodes');
-          controller.get('controllers.nodes').set('nodes', nodes.filter(function(n) {
-            return n.Node !== node.Node;
-          }));
-          controller.transitionToRoute('nodes');
-        }).fail(function(response) {
-          controller.set('errorMessage', 'Received error while processing: ' + response.statusText);
-        });
-      }
-    },
-
     invalidateSession: function(sessionId) {
       this.set('isLoading', true);
       var controller = this;
@@ -342,7 +314,7 @@ App.AclsController = Ember.ArrayController.extend({
   filterText: "Filter by name or ID",
   searchBar: true,
   newAclButton: true,
-  types: ["management", "client"],
+  types: ["client", "management"],
 
   dc: Ember.computed.alias("controllers.dc"),
   items: Ember.computed.alias("acls"),
@@ -412,7 +384,7 @@ App.AclsShowController = Ember.ObjectController.extend({
   needs: ["dc", "acls"],
   dc: Ember.computed.alias("controllers.dc"),
   isLoading: false,
-  types: ["management", "client"],
+  types: ["client", "management"],
 
   actions: {
     set: function() {
@@ -529,6 +501,23 @@ App.SettingsController = Ember.ObjectController.extend({
         notify('Settings reset', 3000);
         this.set('isLoading', false);
       }
+    },
+
+    close: function() {
+      this.transitionToRoute('index');
+    }
+  }
+});
+
+App.ErrorController = Ember.ObjectController.extend({
+  actions: {
+    resetToken: function() {
+      App.set('settings.token', '');
+      this.transitionToRoute('settings');
+    },
+
+    backHome: function() {
+      this.transitionToRoute('index');
     }
   }
 });

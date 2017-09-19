@@ -250,7 +250,9 @@ App.ServicesShowRoute = App.BaseRoute.extend({
   setupController: function(controller, model) {
     var tags = [];
     model.map(function(obj){
-      tags = tags.concat(obj.Service.Tags);
+      if (obj.Service.Tags !== null) {
+        tags = tags.concat(obj.Service.Tags);
+      }
     });
 
     tags = tags.filter(function(n){ return n !== undefined; });
@@ -290,10 +292,11 @@ App.NodesShowRoute = App.BaseRoute.extend({
     var distances = [];
     dc.coordinates.forEach(function (node) {
       if (params.name == node.Node) {
+        var segment = node.Segment;
         dc.coordinates.forEach(function (other) {
-          if (node.Node != other.Node) {
+          if (node.Node != other.Node && other.Segment == segment) {
             var dist = distance(node, other);
-            distances.push({ node: other.Node, distance: dist });
+            distances.push({ node: other.Node, distance: dist, segment: segment });
             sum += dist;
             if (dist < min) {
               min = dist;
@@ -325,7 +328,7 @@ App.NodesShowRoute = App.BaseRoute.extend({
       max = 0;
     }
 
-    // Return a promise hash of the node and nodes
+    // Return a promise hash of the node
     return Ember.RSVP.hash({
       dc: dc.dc,
       token: token,
@@ -337,9 +340,6 @@ App.NodesShowRoute = App.BaseRoute.extend({
         max: parseInt(max * 100) / 100
       },
       node: Ember.$.getJSON(formatUrl(consulHost + '/v1/internal/ui/node/' + params.name, dc.dc, token)).then(function(data) {
-        return App.Node.create(data);
-      }),
-      nodes: Ember.$.getJSON(formatUrl(consulHost + '/v1/internal/ui/node/' + params.name, dc.dc, token)).then(function(data) {
         return App.Node.create(data);
       })
     });
@@ -357,12 +357,6 @@ App.NodesShowRoute = App.BaseRoute.extend({
       controller.set('content', models.node);
       controller.set('sessions', models.sessions);
       controller.set('tomography', models.tomography);
-      //
-      // Since we have 2 column layout, we need to also display the
-      // list of nodes on the left. Hence setting the attribute
-      // {{nodes}} on the controller.
-      //
-      controller.set('nodes', models.nodes);
   }
 });
 
@@ -429,7 +423,7 @@ App.AclsShowRoute = App.BaseRoute.extend({
     var dc = this.modelFor('dc').dc;
     var token = App.get('settings.token');
 
-    // Return a promise hash of the node and nodes
+    // Return a promise hash of the ACLs
     return Ember.RSVP.hash({
       dc: dc,
       acl: Ember.$.getJSON(formatUrl(consulHost + '/v1/acl/info/'+ params.id, dc, token)).then(function(data) {

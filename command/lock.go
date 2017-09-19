@@ -1,7 +1,6 @@
 package command
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"path"
@@ -10,9 +9,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hashicorp/consul/agent"
 	"github.com/hashicorp/consul/api"
-	"github.com/hashicorp/consul/command/agent"
-	"github.com/mitchellh/cli"
 )
 
 const (
@@ -37,8 +35,9 @@ const (
 // LockCommand is a Command implementation that is used to setup
 // a "lock" which manages lock acquisition and invokes a sub-process
 type LockCommand struct {
+	BaseCommand
+
 	ShutdownCh <-chan struct{}
-	Ui         cli.Ui
 
 	child     *os.Process
 	childLock sync.Mutex
@@ -49,42 +48,23 @@ func (c *LockCommand) Help() string {
 	helpText := `
 Usage: consul lock [options] prefix child...
 
-  Acquires a lock or semaphore at a given path, and invokes a child
-  process when successful. The child process can assume the lock is
-  held while it executes. If the lock is lost or communication is
-  disrupted the child process will be sent a SIGTERM signal and given
-  time to gracefully exit. After the grace period expires the process
-  will be hard terminated.
+  Acquires a lock or semaphore at a given path, and invokes a child process
+  when successful. The child process can assume the lock is held while it
+  executes. If the lock is lost or communication is disrupted the child
+  process will be sent a SIGTERM signal and given time to gracefully exit.
+  After the grace period expires the process will be hard terminated.
 
-  For Consul agents on Windows, the child process is always hard
-  terminated with a SIGKILL, since Windows has no POSIX compatible
-  notion for SIGTERM.
+  For Consul agents on Windows, the child process is always hard terminated
+  with a SIGKILL, since Windows has no POSIX compatible notion for SIGTERM.
 
-  When -n=1, only a single lock holder or leader exists providing
-  mutual exclusion. Setting a higher value switches to a semaphore
-  allowing multiple holders to coordinate.
+  When -n=1, only a single lock holder or leader exists providing mutual
+  exclusion. Setting a higher value switches to a semaphore allowing multiple
+  holders to coordinate.
 
   The prefix provided must have write privileges.
 
-Options:
+` + c.BaseCommand.Help()
 
-  -http-addr=127.0.0.1:8500  HTTP address of the Consul agent.
-  -n=1                       Maximum number of allowed lock holders. If this
-                             value is one, it operates as a lock, otherwise
-                             a semaphore is used.
-  -name=""                   Optional name to associate with lock session.
-  -token=""                  ACL token to use. Defaults to that of agent.
-  -pass-stdin                Pass stdin to child process.
-  -try=timeout               Attempt to acquire the lock up to the given
-                             timeout (eg. "15s").
-  -monitor-retry=n           Retry up to n times if Consul returns a 500 error
-                             while monitoring the lock. This allows riding out brief
-                             periods of unavailability without causing leader
-                             elections, but increases the amount of time required
-                             to detect a lost lock in some cases. Defaults to 3,
-                             with a 1s wait between retries. Set to 0 to disable.
-  -verbose                   Enables verbose output
-`
 	return strings.TrimSpace(helpText)
 }
 
@@ -93,145 +73,152 @@ func (c *LockCommand) Run(args []string) int {
 	return c.run(args, &lu)
 }
 
-// run exposes the underlying lock for testing.
 func (c *LockCommand) run(args []string, lu **LockUnlock) int {
-	var childDone chan struct{}
-	var name, token string
 	var limit int
+	var monitorRetry int
+	var name string
 	var passStdin bool
-	var try string
-	var retry int
-	cmdFlags := flag.NewFlagSet("watch", flag.ContinueOnError)
-	cmdFlags.Usage = func() { c.Ui.Output(c.Help()) }
-	cmdFlags.IntVar(&limit, "n", 1, "")
-	cmdFlags.StringVar(&name, "name", "", "")
-	cmdFlags.StringVar(&token, "token", "", "")
-	cmdFlags.BoolVar(&passStdin, "pass-stdin", false, "")
-	cmdFlags.StringVar(&try, "try", "", "")
-	cmdFlags.IntVar(&retry, "monitor-retry", defaultMonitorRetry, "")
-	cmdFlags.BoolVar(&c.verbose, "verbose", false, "")
-	httpAddr := HTTPAddrFlag(cmdFlags)
-	if err := cmdFlags.Parse(args); err != nil {
+	var propagateChildCode bool
+	var timeout time.Duration
+
+	f := c.BaseCommand.NewFlagSet(c)
+	f.BoolVar(&propagateChildCode, "child-exit-code", false,
+		"Exit 2 if the child process exited with an error if this is true, "+
+			"otherwise this doesn't propagate an error from the child. The "+
+			"default value is false.")
+	f.IntVar(&limit, "n", 1,
+		"Optional limit on the number of concurrent lock holders. The underlying "+
+			"implementation switches from a lock to a semaphore when the value is "+
+			"greater than 1. The default value is 1.")
+	f.IntVar(&monitorRetry, "monitor-retry", defaultMonitorRetry,
+		"Number of times to retry if Consul returns a 500 error while monitoring "+
+			"the lock. This allows riding out brief periods of unavailability "+
+			"without causing leader elections, but increases the amount of time "+
+			"required to detect a lost lock in some cases. The default value is 3, "+
+			"with a 1s wait between retries. Set this value to 0 to disable retires.")
+	f.StringVar(&name, "name", "",
+		"Optional name to associate with the lock session. It not provided, one "+
+			"is generated based on the provided child command.")
+	f.BoolVar(&passStdin, "pass-stdin", false,
+		"Pass stdin to the child process.")
+	f.DurationVar(&timeout, "timeout", 0,
+		"Maximum amount of time to wait to acquire the lock, specified as a "+
+			"duration like \"1s\" or \"3h\". The default value is 0.")
+	f.BoolVar(&c.verbose, "verbose", false,
+		"Enable verbose (debugging) output.")
+
+	// Deprecations
+	f.DurationVar(&timeout, "try", 0,
+		"DEPRECATED. Use -timeout instead.")
+
+	if err := c.BaseCommand.Parse(args); err != nil {
 		return 1
 	}
 
 	// Check the limit
 	if limit <= 0 {
-		c.Ui.Error(fmt.Sprintf("Lock holder limit must be positive"))
+		c.UI.Error(fmt.Sprintf("Lock holder limit must be positive"))
 		return 1
 	}
 
 	// Verify the prefix and child are provided
-	extra := cmdFlags.Args()
+	extra := f.Args()
 	if len(extra) < 2 {
-		c.Ui.Error("Key prefix and child command must be specified")
-		c.Ui.Error("")
-		c.Ui.Error(c.Help())
+		c.UI.Error("Key prefix and child command must be specified")
 		return 1
 	}
 	prefix := extra[0]
 	prefix = strings.TrimPrefix(prefix, "/")
 	script := strings.Join(extra[1:], " ")
 
+	if timeout < 0 {
+		c.UI.Error("Timeout must be positive")
+		return 1
+	}
+
 	// Calculate a session name if none provided
 	if name == "" {
 		name = fmt.Sprintf("Consul lock for '%s' at '%s'", script, prefix)
 	}
 
-	// Verify the duration if given.
-	oneshot := false
-	var wait time.Duration
-	if try != "" {
-		var err error
-		wait, err = time.ParseDuration(try)
-		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error parsing try timeout: %s", err))
-			return 1
-		}
-
-		if wait <= 0 {
-			c.Ui.Error("Try timeout must be positive")
-			return 1
-		}
-
-		oneshot = true
-	}
+	// Calculate oneshot
+	oneshot := timeout > 0
 
 	// Check the retry parameter
-	if retry < 0 {
-		c.Ui.Error("Number for 'monitor-retry' must be >= 0")
+	if monitorRetry < 0 {
+		c.UI.Error("Number for 'monitor-retry' must be >= 0")
 		return 1
 	}
 
 	// Create and test the HTTP client
-	conf := api.DefaultConfig()
-	conf.Address = *httpAddr
-	conf.Token = token
-	client, err := api.NewClient(conf)
+	client, err := c.BaseCommand.HTTPClient()
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error connecting to Consul agent: %s", err))
+		c.UI.Error(fmt.Sprintf("Error connecting to Consul agent: %s", err))
 		return 1
 	}
 	_, err = client.Agent().NodeName()
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error querying Consul agent: %s", err))
+		c.UI.Error(fmt.Sprintf("Error querying Consul agent: %s", err))
 		return 1
 	}
 
 	// Setup the lock or semaphore
 	if limit == 1 {
-		*lu, err = c.setupLock(client, prefix, name, oneshot, wait, retry)
+		*lu, err = c.setupLock(client, prefix, name, oneshot, timeout, monitorRetry)
 	} else {
-		*lu, err = c.setupSemaphore(client, limit, prefix, name, oneshot, wait, retry)
+		*lu, err = c.setupSemaphore(client, limit, prefix, name, oneshot, timeout, monitorRetry)
 	}
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Lock setup failed: %s", err))
+		c.UI.Error(fmt.Sprintf("Lock setup failed: %s", err))
 		return 1
 	}
 
 	// Attempt the acquisition
 	if c.verbose {
-		c.Ui.Info("Attempting lock acquisition")
+		c.UI.Info("Attempting lock acquisition")
 	}
 	lockCh, err := (*lu).lockFn(c.ShutdownCh)
 	if lockCh == nil {
 		if err == nil {
-			c.Ui.Error("Shutdown triggered or timeout during lock acquisition")
+			c.UI.Error("Shutdown triggered or timeout during lock acquisition")
 		} else {
-			c.Ui.Error(fmt.Sprintf("Lock acquisition failed: %s", err))
+			c.UI.Error(fmt.Sprintf("Lock acquisition failed: %s", err))
 		}
 		return 1
 	}
 
 	// Check if we were shutdown but managed to still acquire the lock
+	var childCode int
+	var childErr chan error
 	select {
 	case <-c.ShutdownCh:
-		c.Ui.Error("Shutdown triggered during lock acquisition")
+		c.UI.Error("Shutdown triggered during lock acquisition")
 		goto RELEASE
 	default:
 	}
 
 	// Start the child process
-	childDone = make(chan struct{})
+	childErr = make(chan error, 1)
 	go func() {
-		if err := c.startChild(script, childDone, passStdin); err != nil {
-			c.Ui.Error(fmt.Sprintf("%s", err))
-		}
+		childErr <- c.startChild(script, passStdin)
 	}()
 
 	// Monitor for shutdown, child termination, or lock loss
 	select {
 	case <-c.ShutdownCh:
 		if c.verbose {
-			c.Ui.Info("Shutdown triggered, killing child")
+			c.UI.Info("Shutdown triggered, killing child")
 		}
 	case <-lockCh:
 		if c.verbose {
-			c.Ui.Info("Lock lost, killing child")
+			c.UI.Info("Lock lost, killing child")
 		}
-	case <-childDone:
+	case err := <-childErr:
+		if err != nil {
+			childCode = 2
+		}
 		if c.verbose {
-			c.Ui.Info("Child terminated, releasing lock")
+			c.UI.Info("Child terminated, releasing lock")
 		}
 		goto RELEASE
 	}
@@ -239,29 +226,37 @@ func (c *LockCommand) run(args []string, lu **LockUnlock) int {
 	// Prevent starting a new child.  The lock is never released
 	// after this point.
 	c.childLock.Lock()
+
 	// Kill any existing child
-	if err := c.killChild(childDone); err != nil {
-		c.Ui.Error(fmt.Sprintf("%s", err))
+	if err := c.killChild(childErr); err != nil {
+		c.UI.Error(fmt.Sprintf("%s", err))
 	}
 
 RELEASE:
 	// Release the lock before termination
 	if err := (*lu).unlockFn(); err != nil {
-		c.Ui.Error(fmt.Sprintf("Lock release failed: %s", err))
+		c.UI.Error(fmt.Sprintf("Lock release failed: %s", err))
 		return 1
 	}
 
 	// Cleanup the lock if no longer in use
 	if err := (*lu).cleanupFn(); err != nil {
 		if err != (*lu).inUseErr {
-			c.Ui.Error(fmt.Sprintf("Lock cleanup failed: %s", err))
+			c.UI.Error(fmt.Sprintf("Lock cleanup failed: %s", err))
 			return 1
 		} else if c.verbose {
-			c.Ui.Info("Cleanup aborted, lock in use")
+			c.UI.Info("Cleanup aborted, lock in use")
 		}
 	} else if c.verbose {
-		c.Ui.Info("Cleanup succeeded")
+		c.UI.Info("Cleanup succeeded")
 	}
+
+	// If we detected an error from the child process then we propagate
+	// that.
+	if propagateChildCode {
+		return childCode
+	}
+
 	return 0
 }
 
@@ -277,7 +272,7 @@ func (c *LockCommand) setupLock(client *api.Client, prefix, name string,
 	// which we can report to the user.
 	key := path.Join(prefix, api.DefaultSemaphoreKey)
 	if c.verbose {
-		c.Ui.Info(fmt.Sprintf("Setting up lock at path: %s", key))
+		c.UI.Info(fmt.Sprintf("Setting up lock at path: %s", key))
 	}
 	opts := api.LockOptions{
 		Key:              key,
@@ -311,7 +306,7 @@ func (c *LockCommand) setupLock(client *api.Client, prefix, name string,
 func (c *LockCommand) setupSemaphore(client *api.Client, limit int, prefix, name string,
 	oneshot bool, wait time.Duration, retry int) (*LockUnlock, error) {
 	if c.verbose {
-		c.Ui.Info(fmt.Sprintf("Setting up semaphore (limit %d) at prefix: %s", limit, prefix))
+		c.UI.Info(fmt.Sprintf("Setting up semaphore (limit %d) at prefix: %s", limit, prefix))
 	}
 	opts := api.SemaphoreOptions{
 		Prefix:           prefix,
@@ -340,15 +335,14 @@ func (c *LockCommand) setupSemaphore(client *api.Client, limit int, prefix, name
 
 // startChild is a long running routine used to start and
 // wait for the child process to exit.
-func (c *LockCommand) startChild(script string, doneCh chan struct{}, passStdin bool) error {
-	defer close(doneCh)
+func (c *LockCommand) startChild(script string, passStdin bool) error {
 	if c.verbose {
-		c.Ui.Info(fmt.Sprintf("Starting handler '%s'", script))
+		c.UI.Info(fmt.Sprintf("Starting handler '%s'", script))
 	}
 	// Create the command
 	cmd, err := agent.ExecScript(script)
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error executing handler: %s", err))
+		c.UI.Error(fmt.Sprintf("Error executing handler: %s", err))
 		return err
 	}
 
@@ -358,7 +352,7 @@ func (c *LockCommand) startChild(script string, doneCh chan struct{}, passStdin 
 	)
 	if passStdin {
 		if c.verbose {
-			c.Ui.Info("Stdin passed to handler process")
+			c.UI.Info("Stdin passed to handler process")
 		}
 		cmd.Stdin = os.Stdin
 	} else {
@@ -370,7 +364,7 @@ func (c *LockCommand) startChild(script string, doneCh chan struct{}, passStdin 
 	// Start the child process
 	c.childLock.Lock()
 	if err := cmd.Start(); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error starting handler: %s", err))
+		c.UI.Error(fmt.Sprintf("Error starting handler: %s", err))
 		c.childLock.Unlock()
 		return err
 	}
@@ -381,7 +375,7 @@ func (c *LockCommand) startChild(script string, doneCh chan struct{}, passStdin 
 
 	// Wait for the child process
 	if err := cmd.Wait(); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error running handler: %s", err))
+		c.UI.Error(fmt.Sprintf("Error running handler: %s", err))
 		return err
 	}
 	return nil
@@ -392,21 +386,21 @@ func (c *LockCommand) startChild(script string, doneCh chan struct{}, passStdin 
 // termination.
 // On Windows, the child is always hard terminated with a SIGKILL, even
 // on the first attempt.
-func (c *LockCommand) killChild(childDone chan struct{}) error {
+func (c *LockCommand) killChild(childErr chan error) error {
 	// Get the child process
 	child := c.child
 
 	// If there is no child process (failed to start), we can quit early
 	if child == nil {
 		if c.verbose {
-			c.Ui.Info("No child process to kill")
+			c.UI.Info("No child process to kill")
 		}
 		return nil
 	}
 
 	// Attempt termination first
 	if c.verbose {
-		c.Ui.Info(fmt.Sprintf("Terminating child pid %d", child.Pid))
+		c.UI.Info(fmt.Sprintf("Terminating child pid %d", child.Pid))
 	}
 	if err := signalPid(child.Pid, syscall.SIGTERM); err != nil {
 		return fmt.Errorf("Failed to terminate %d: %v", child.Pid, err)
@@ -414,21 +408,21 @@ func (c *LockCommand) killChild(childDone chan struct{}) error {
 
 	// Wait for termination, or until a timeout
 	select {
-	case <-childDone:
+	case <-childErr:
 		if c.verbose {
-			c.Ui.Info("Child terminated")
+			c.UI.Info("Child terminated")
 		}
 		return nil
 	case <-time.After(lockKillGracePeriod):
 		if c.verbose {
-			c.Ui.Info(fmt.Sprintf("Child did not exit after grace period of %v",
+			c.UI.Info(fmt.Sprintf("Child did not exit after grace period of %v",
 				lockKillGracePeriod))
 		}
 	}
 
 	// Send a final SIGKILL
 	if c.verbose {
-		c.Ui.Info(fmt.Sprintf("Killing child pid %d", child.Pid))
+		c.UI.Info(fmt.Sprintf("Killing child pid %d", child.Pid))
 	}
 	if err := signalPid(child.Pid, syscall.SIGKILL); err != nil {
 		return fmt.Errorf("Failed to kill %d: %v", child.Pid, err)
