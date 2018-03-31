@@ -49,12 +49,12 @@ upload: version tools
 		git tag v$(shell echo $(DEB_VERSION) | tr '~' '_' )
 
 runcontainer:
-	mkdir -p /tmp/consul-deb
+	mkdir -p $(shell pwd)/consul-deb
 	docker run -it --rm \
 		-v ~/.devscripts:/root/.devscripts \
 		-v ~/.gnupg:/root/.gnupg \
 		-v $(PKGDIR):/opt/consul-deb:ro \
-		-v /tmp/consul-deb:/tmp/consul-deb \
+		-v $(shell pwd)/consul-deb:/tmp/consul-deb \
 		$(CONTAINER_OPTS) \
 		ubuntu:$(DISTRO)-consul-deb $(CONTAINER_CMD)
 
