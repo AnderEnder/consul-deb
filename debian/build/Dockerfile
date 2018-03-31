@@ -6,7 +6,7 @@ ARG        GIT_COMMIT
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
     apt-get install -y equivs ubuntu-dev-tools git-buildpackage software-properties-common && \
-    apt-add-repository ppa:gophers/archive && \
+    add-apt-repository -y ppa:longsleep/golang-backports && \
     apt-get update
 
 ENV GOPATH=/go \
